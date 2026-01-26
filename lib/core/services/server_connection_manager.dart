@@ -113,6 +113,7 @@ class ServerConnectionManager {
 
     batch(() {
       services.connectionState.connectionState.value = CoState.idle;
+      services.connectionState.netStatus.value = null;
       services.serverStatusState.setActiveServers({});
     });
   }
