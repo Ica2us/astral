@@ -1,0 +1,262 @@
+name: 📲 Android 构建 arm64-v8a 架构 APK (修复 Impeller 崩溃)
+
+on:
+  workflow_dispatch:
+  push:  # 每次 push 到仓库时触发
+    tags:
+      - 'v*'  # 指定触发分支
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 确保有写入权限
+      packages: write
+    
+    env:
+      FLUTTER_VERSION: main
+      FLUTTER_CHANNEL: main
+      RUST_VERSION: 1.89.0
+      NDK_VERSION: 28.2.13676358
+      JDK_VERSION: 17
+      CMAKE_VERSION: 3.18.1
+    
+    steps:
+      - name: 🛠️ 检出代码仓库
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - name: 🦀 设置 Rust 工具链 1.89.0
+        run: |
+          chmod +x $GITHUB_WORKSPACE/scripts/install_rust.sh
+          $GITHUB_WORKSPACE/scripts/install_rust.sh
+
+      - name: 📦 安装系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libc6-dev
+          sudo apt-get install -y libc6-dev-armhf-cross gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
+          sudo apt-get install -y clang llvm libclang-dev
+          sudo apt-get install -y libc-dev
+          sudo apt-get install -y libc6-dev-i386 gcc-multilib g++-multilib
+          sudo apt-get install -y protobuf-compiler
+
+      - name: 🎯 配置 Rust 目标架构
+        run: |
+          rustup target add armv7-linux-androideabi
+          rustup target add aarch64-linux-android
+
+      - name: ☕ 设置 JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'adopt'
+
+      - name: 🤖 设置 Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          ndk-version: '28.2.13676358'
+          cmake-version: '3.18.1'
+          
+      - name: 🐦 安装 Flutter
+        run: |
+          chmod +x $GITHUB_WORKSPACE/scripts/install_flutter.sh
+          $GITHUB_WORKSPACE/scripts/install_flutter.sh
+
+      - name: 💾 检查磁盘空间
+        run: |
+          echo "=== 构建前磁盘空间 ==="
+          df -h
+
+      - name: 📚 安装 Flutter 依赖
+        run: |
+          flutter pub get
+
+      # ========== 新增：修复 Impeller 崩溃 ==========
+      - name: 🔧 禁用 Impeller 渲染引擎 (修复小米设备崩溃)
+        run: |
+          echo "正在配置禁用 Impeller..."
+          
+          # 1. 修改 AndroidManifest.xml
+          MANIFEST_PATH="android/app/src/main/AndroidManifest.xml"
+          
+          if [ -f "$MANIFEST_PATH" ]; then
+            echo "找到 AndroidManifest.xml"
+            
+            # 检查是否已经存在 Impeller 配置
+            if grep -q "EnableImpeller" "$MANIFEST_PATH"; then
+              echo "已存在 Impeller 配置，更新为 false"
+              sed -i 's/android:value="true"/android:value="false"/g' "$MANIFEST_PATH"
+            else
+              echo "添加 Impeller 禁用配置"
+              # 找到 <application 标签（可能跨多行）
+              # 在找到第一个 > 后插入配置
+              sed -i '/<application/,/>/{
+                # 在第一个 > 后插入
+                />/{
+                  a\        <!-- 禁用 Impeller 渲染引擎以修复崩溃 -->\
+        <meta-data\
+            android:name="io.flutter.embedding.android.EnableImpeller"\
+            android:value="false" />
+                  # 只插入一次
+                  :a; n; ba
+                }
+              }' "$MANIFEST_PATH"
+            fi
+            
+            # 确保硬件加速启用
+            if ! grep -q 'android:hardwareAccelerated' "$MANIFEST_PATH"; then
+              sed -i 's/<application/<application android:hardwareAccelerated="true"/' "$MANIFEST_PATH"
+              echo "✓ 已启用硬件加速"
+            fi
+            
+            echo "✓ AndroidManifest.xml 已更新"
+            echo ""
+            echo "--- AndroidManifest.xml 相关内容 ---"
+            grep -A 3 -B 1 "application" "$MANIFEST_PATH" | head -20
+          else
+            echo "⚠️ 警告: 未找到 AndroidManifest.xml"
+            exit 1
+          fi
+          
+          # 2. 修改 build.gradle
+          BUILD_GRADLE_PATH="android/app/build.gradle"
+          
+          if [ -f "$BUILD_GRADLE_PATH" ]; then
+            # 检查是否已经添加配置
+            if grep -q "enableImpeller" "$BUILD_GRADLE_PATH"; then
+              echo "✓ build.gradle 已包含 Impeller 配置"
+            else
+              # 在 defaultConfig 块中添加配置
+              sed -i '/defaultConfig {/a\        // 禁用 Impeller 渲染引擎\n        manifestPlaceholders = [enableImpeller: "false"]' "$BUILD_GRADLE_PATH"
+              echo "✓ build.gradle 已更新"
+            fi
+            
+            echo ""
+            echo "--- build.gradle defaultConfig 部分 ---"
+            sed -n '/defaultConfig {/,/}/p' "$BUILD_GRADLE_PATH" | head -15
+          else
+            echo "⚠️ 警告: 未找到 build.gradle"
+          fi
+          
+          echo ""
+          echo "=========================================="
+          echo "Impeller 禁用配置完成！"
+          echo "=========================================="
+      # ========== 修复配置结束 ==========
+          
+      - name: 🔐 设置签名配置
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > android/app/upload-keystore.jks
+          echo "storeFile=upload-keystore.jks" >> android/key.properties
+          echo "keyAlias=${{ secrets.KEY_ALIAS }}" >> android/key.properties
+          echo "storePassword=${{ secrets.STORE_PASSWORD }}" >> android/key.properties
+          echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> android/key.properties
+          # 调试信息（不会显示敏感内容）
+          echo "检查 key.properties 是否创建成功:"
+          ls -la android/key.properties
+          echo "检查 keystore 是否创建成功:"
+          ls -la android/app/upload-keystore.jks
+
+      - name: 🐦 设置 Flutter
+        run: |
+          flutter --version
+
+      - name: 🦀 安装 cargo-ndk
+        run: |
+          cargo install cargo-ndk
+
+      - name: 🔧 设置 bindgen 环境变量
+        run: |
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I/usr/include -I/usr/include/x86_64-linux-gnu" >> $GITHUB_ENV
+          echo "LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
+
+      - name: 🛠️ 构建 arm64-v8a 架构 APK
+        run: |
+          # 不使用 --no-enable-impeller 标志（该选项可能不存在）
+          # Impeller 已通过 AndroidManifest.xml 和 build.gradle 禁用
+          flutter build apk --release --target-platform android-arm64
+
+      - name: 📋 显示构建信息
+        run: |
+          echo "=== 构建完成信息 ==="
+          ls -lh build/app/outputs/flutter-apk/
+          echo ""
+          echo "APK 文件信息:"
+          file build/app/outputs/flutter-apk/app-release.apk
+          echo ""
+          echo "APK 大小:"
+          du -h build/app/outputs/flutter-apk/app-release.apk
+          echo ""
+          echo "=== 验证 Impeller 配置 ==="
+          # 使用 aapt 查看 APK 中的配置
+          if command -v aapt &> /dev/null; then
+            aapt dump xmltree build/app/outputs/flutter-apk/app-release.apk AndroidManifest.xml | grep -A 5 "Impeller" || echo "未找到 Impeller 配置（可能被混淆）"
+          else
+            echo "aapt 不可用，跳过验证"
+          fi
+
+      - name: 📤 上传 arm64-v8a 架构 APK 到 Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: astral-arm64-v8a-apk-impeller-disabled
+          path: build/app/outputs/flutter-apk/app-release.apk
+          
+      - name: 📝 创建构建说明
+        run: |
+          cat > build-info.txt << EOF
+          ============================================
+          Astral APK 构建信息
+          ============================================
+          
+          构建时间: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Flutter 版本: $(flutter --version | head -n 1)
+          架构: arm64-v8a (aarch64)
+          
+          ============================================
+          修复说明
+          ============================================
+          
+          问题: 小米设备崩溃
+          错误: Check failed: back_texture. Context is valid:0
+          
+          解决方案:
+          ✅ 在 AndroidManifest.xml 中禁用 Impeller
+          ✅ 在 build.gradle 中添加 manifestPlaceholders
+          ✅ 使用 Skia 渲染引擎代替 Impeller
+          
+          修改的文件:
+          - android/app/src/main/AndroidManifest.xml
+          - android/app/build.gradle
+          
+          ============================================
+          预期效果
+          ============================================
+          
+          ✅ 应用可以在小米设备上正常运行
+          ✅ 不会出现图形上下文错误
+          ✅ 性能基本无影响（Skia 渲染器稳定可靠）
+          
+          ============================================
+          测试建议
+          ============================================
+          
+          1. 在小米设备上安装此 APK
+          2. 启动应用并测试各项功能
+          3. 检查是否还有崩溃问题
+          4. 如有问题，请查看 logcat 日志
+          
+          获取日志命令:
+          adb logcat -s flutter:V AndroidRuntime:E
+          
+          ============================================
+          EOF
+          cat build-info.txt
+          
+      - name: 📤 上传构建说明
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-info
+          path: build-info.txt
